@@ -273,7 +273,12 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         path, query = parsed.path, dict(urllib.parse.parse_qsl(parsed.query))
         user = current_user(self)
-        base = f"http://{self.headers.get('Host', 'localhost')}"
+        # Behind nginx, X-Forwarded-Proto tells us the public scheme.
+        # Without this the portal shows http:// URLs, and TradingView
+        # POSTs to http get a 301 redirect to https, which it does not
+        # follow as a POST — it ends up as a GET and returns 404.
+        scheme = self.headers.get("X-Forwarded-Proto", "http").split(",")[0].strip() or "http"
+        base = f"{scheme}://{self.headers.get('Host', 'localhost')}"
 
         if path == "/healthz":
             return self.send_json(200, {"ok": True})

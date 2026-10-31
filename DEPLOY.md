@@ -53,8 +53,13 @@ Either way, the folder you run the deploy script from must contain
 ## 3. Run the deploy script
 
 ```bash
+chmod +x deploy.sh
 DOMAIN=sparkrelai.ecovoyage.net ./deploy.sh
 ```
+
+Note: after a GitHub clone, `deploy.sh` may not be executable (the
+GitHub push does not preserve file modes). `chmod +x` fixes that, or
+run it as `bash deploy.sh` instead.
 
 It installs Python, nginx, ufw and certbot, copies the portal to
 `/opt/sparkrelai`, installs the systemd service, and configures nginx
