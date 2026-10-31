@@ -91,13 +91,27 @@ terminal monitoring. That is the biggest cost and complexity in a
 PineConnector Edge-style product, and it is best added after the bridge
 itself is proven.
 
+## Safety controls
+
+- **Per-connection max volume:** set it when you create a connection,
+  and change it on the connection page. Buy/sell webhook signals above
+  the cap are rejected (HTTP 400) and never queued. Close signals are
+  not volume-capped, so you can always flatten a position.
+- **Kill switch:** pause a connection from its own page, or from
+  `/admin` (admin only). Pausing blocks new webhooks (HTTP 403), makes
+  the EA poll return nothing, and marks pending signals `skipped`, so
+  they cannot execute after you resume. Resume from the same button.
+- **EA second defence:** the EA's `MaxVolumeLots` input (default 0.10)
+  skips buy/sell signals above that size at the terminal, even if a
+  signal somehow reached it. Set it to 0 to rely on the portal cap only.
+- Still not in this build: daily loss limits, per-user signal quotas,
+  rate limiting on `/webhook/*`, email verification, and real billing.
+  Add those before offering it to paying users.
+
 ## Safety and honesty
 
 - Test on demo first. A bad alert message, symbol map, or volume can
   open real trades.
-- This MVP has no trade-size caps, daily loss limits, or kill switch
-  beyond closing positions via a `close` signal. Add those before
-  offering it to paying users.
 - Automated trading may be restricted by some brokers and prop firms.
   Check their rules before using it on a funded account.
 - Nothing here is financial advice.

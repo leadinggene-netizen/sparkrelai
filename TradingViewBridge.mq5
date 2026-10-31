@@ -22,6 +22,7 @@ input string   ServerURL       = "http://127.0.0.1:8000"; // Portal URL, no trai
 input int      PollSeconds     = 2;                        // How often to check for signals
 input ulong    MagicNumber     = 20261031;                 // Magic number for EA trades
 input double   DefaultVolume   = 0.01;                     // Used when a signal has no volume
+input double   MaxVolumeLots   = 0.10;                     // Second defence: skip buy/sell signals above this (0 = no EA cap, portal cap still applies)
 input string   SymbolMap       = "";                       // e.g. XAUUSD=XAUUSD.m,EURUSD=EURUSD.pro
 input int      MaxSlippagePts  = 30;                       // Max slippage in points
 
@@ -153,6 +154,11 @@ void OnTick()
       double tp        = StringToDouble(f[5]);
       string symbol    = MappedSymbol(tv_symbol);
       if(volume <= 0) volume = DefaultVolume;
+      if((action == "buy" || action == "sell") && MaxVolumeLots > 0 && volume > MaxVolumeLots)
+      {
+         Report(signal_id, "skipped", 0, "volume exceeds EA max: " + DoubleToString(volume, 2));
+         continue;
+      }
 
       trade.SetExpertMagicNumber(MagicNumber);
       trade.SetDeviationInPoints(MaxSlippagePts);

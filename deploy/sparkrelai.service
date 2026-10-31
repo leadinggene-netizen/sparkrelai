@@ -1,0 +1,16 @@
+[Unit]
+Description=TradingView to MT5 bridge portal
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/sparkrelai
+Environment=HOST=127.0.0.1
+Environment=PORT=PORT_PLACEHOLDER
+ExecStart=/usr/bin/python3 /opt/sparkrelai/app.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

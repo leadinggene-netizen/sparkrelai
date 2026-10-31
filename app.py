@@ -17,6 +17,14 @@ How it works:
   5. The EA reports fills / errors back, and the user watches them
      in their workspace signal log.
 
+Safety controls (built in):
+  - Per-connection max-volume cap: buy/sell signals above the cap are
+    rejected by the webhook and never queued.
+  - Kill switch: pausing a connection blocks new webhooks, stops the EA
+    poll from returning signals, and marks any pending signals skipped,
+    so they do not execute later when the connection is resumed.
+  - The EA also has its own MaxVolumeLots input as a second defence.
+
 This is an MVP. Before charging real users, add HTTPS (see README),
 email verification, real payment webhooks, backups, and rate limiting.
 """
@@ -73,6 +81,8 @@ def init_db():
         webhook_token TEXT UNIQUE NOT NULL,
         symbol_map TEXT NOT NULL DEFAULT '{}',
         default_volume REAL NOT NULL DEFAULT 0.01,
+        max_volume REAL NOT NULL DEFAULT 0.10,
+        is_paused INTEGER NOT NULL DEFAULT 0,
         account_login TEXT DEFAULT '',
         broker TEXT DEFAULT '',
         last_heartbeat TEXT,
@@ -94,6 +104,12 @@ def init_db():
         updated_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
     """)
+    # Migrations for databases created before the safety controls.
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(connections)")}
+    if "max_volume" not in cols:
+        conn.execute("ALTER TABLE connections ADD COLUMN max_volume REAL NOT NULL DEFAULT 0.10")
+    if "is_paused" not in cols:
+        conn.execute("ALTER TABLE connections ADD COLUMN is_paused INTEGER NOT NULL DEFAULT 0")
     conn.commit()
     conn.close()
 
@@ -259,6 +275,9 @@ class Handler(BaseHTTPRequestHandler):
         user = current_user(self)
         base = f"http://{self.headers.get('Host', 'localhost')}"
 
+        if path == "/healthz":
+            return self.send_json(200, {"ok": True})
+
         if path == "/":
             if user:
                 return self.redirect("/dashboard")
@@ -301,14 +320,15 @@ class Handler(BaseHTTPRequestHandler):
             rows = "".join(
                 f"<tr><td><a href='/connections/{c['id']}'>{esc(c['name'])}</a></td>"
                 f"<td>{esc(c['broker'] or '—')} {esc(c['account_login'] or '')}</td>"
-                f"<td>{'<span class=ok>Online</span>' if c['last_heartbeat'] else '<span class=bad>Never connected</span>'}</td>"
+                f"<td>{'<span class=bad>Paused (kill switch)</span>' if c['is_paused'] else ('<span class=ok>Online</span>' if c['last_heartbeat'] else '<span class=bad>Never connected</span>')}</td>"
+                f"<td>max {c['max_volume']} lots</td>"
                 f"<td>{esc(c['last_heartbeat'] or '—')}</td></tr>" for c in conns)
             srows = "".join(
                 f"<tr><td>{s['id']}</td><td>{esc(s['name'])}</td><td>{esc(s['action'])}</td>"
                 f"<td>{esc(s['symbol'])}</td><td>{s['volume']}</td><td>{esc(s['status'])}</td>"
                 f"<td>{esc(s['note'] or '')}</td><td>{esc(s['created_at'])}</td></tr>" for s in sigs)
             body = f"""<p>Plan: <b>{esc(plan['name'])}</b> — {plan['connections']} connection(s). {esc(plan['price'])}</p>
-            <h2>Connections ({len(conns)})</h2><table><tr><th>Name</th><th>MT5 account</th><th>Status</th><th>Last heartbeat</th></tr>{rows or '<tr><td colspan=4>No connections yet.</td></tr>'}</table>
+            <h2>Connections ({len(conns)})</h2><table><tr><th>Name</th><th>MT5 account</th><th>Status</th><th>Max volume</th><th>Last heartbeat</th></tr>{rows or '<tr><td colspan=5>No connections yet.</td></tr>'}</table>
             <p><a href="/connections/new">+ New connection</a></p>
             <h2>Recent signals</h2><table><tr><th>#</th><th>Connection</th><th>Action</th><th>Symbol</th><th>Volume</th><th>Status</th><th>Note</th><th>When</th></tr>{srows or '<tr><td colspan=8>No signals yet.</td></tr>'}</table>"""
             return self.send_html(200, page("Workspace", body, user))
@@ -320,6 +340,7 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_html(200, page("New connection", """
             <form method="post" action="/connections/new"><label>Name <input name="name" required placeholder="e.g. Gold strategy"></label>
             <label>Default volume <input name="default_volume" value="0.01"></label>
+            <label>Max volume (safety cap — buy/sell signals above this are rejected) <input name="max_volume" value="0.10"></label>
             <label>Symbol map (one per line, TradingView=MT5, e.g. XAUUSD=XAUUSD.m) <textarea name="symbol_map" rows="4"></textarea></label>
             <button>Create connection</button></form>""", user))
 
@@ -340,12 +361,20 @@ class Handler(BaseHTTPRequestHandler):
                 f"<tr><td>{s['id']}</td><td>{esc(s['action'])}</td><td>{esc(s['symbol'])}</td>"
                 f"<td>{s['volume']}</td><td>{esc(s['status'])}</td><td>{esc(s['ticket'] or '')}</td>"
                 f"<td>{esc(s['note'] or '')}</td><td>{esc(s['created_at'])}</td></tr>" for s in sigs)
+            paused = bool(c['is_paused'])
+            pause_label = "Resume trading" if paused else "Pause trading (kill switch)"
+            pause_action = "resume" if paused else "pause"
             body = f"""<div class="card"><h2>Connection info</h2>
             <p>Webhook URL (paste into TradingView):<br><code>{esc(webhook)}</code></p>
             <p>License key (paste into the EA):<br><code>{esc(c['license_key'])}</code></p>
-            <p>Default volume: {c['default_volume']} &nbsp; Symbol map: <code>{esc(c['symbol_map'])}</code></p>
+            <p>Default volume: {c['default_volume']} &nbsp; Max volume: {c['max_volume']} lots &nbsp; Symbol map: <code>{esc(c['symbol_map'])}</code></p>
+            <p>Status: {'<span class=bad>Paused — webhooks rejected, EA poll returns nothing, pending signals were skipped</span>' if paused else '<span class=ok>Active</span>'}</p>
             <p>MT5 account: {esc(c['account_login'] or '—')} &nbsp; Broker: {esc(c['broker'] or '—')} &nbsp; Last heartbeat: {esc(c['last_heartbeat'] or 'never')}</p>
             <p><a href="/download/ea">Download TradingViewBridge.mq5</a> — compile it in MetaEditor to get the .ex5 file.</p></div>
+            <div class="card"><h2>Safety controls</h2>
+            <form method="post" action="/connections/{c['id']}/safety"><label>Max volume (lots) <input name="max_volume" value="{c['max_volume']}"></label><button>Update max volume</button></form>
+            <form method="post" action="/connections/{c['id']}/pause"><input type="hidden" name="action" value="{pause_action}"><button>{pause_label}</button></form>
+            <p class="muted">Pausing is the kill switch: it blocks new webhooks, stops the EA poll, and skips any pending signals so they cannot execute after you resume.</p></div>
             <h2>TradingView alert examples</h2>
             <p>JSON message:</p><pre><code>{{"action": "buy", "symbol": "XAUUSD", "volume": 0.1, "sl": 0, "tp": 0}}</code></pre>
             <p>Or plain text:</p><pre><code>buy,XAUUSD,vol=0.1</code></pre>
@@ -359,10 +388,16 @@ class Handler(BaseHTTPRequestHandler):
             conn = db()
             users = conn.execute("SELECT id, email, plan, is_admin, created_at FROM users ORDER BY id").fetchall()
             counts = conn.execute("SELECT user_id, COUNT(*) n FROM connections GROUP BY user_id").fetchall()
+            all_conns = conn.execute("SELECT c.*, u.email FROM connections c JOIN users u ON u.id=c.user_id ORDER BY c.id").fetchall()
             conn.close()
             cmap = {r["user_id"]: r["n"] for r in counts}
             rows = "".join(f"<tr><td>{u['id']}</td><td>{esc(u['email'])}</td><td>{esc(u['plan'])}</td><td>{cmap.get(u['id'], 0)}</td><td>{'yes' if u['is_admin'] else ''}</td><td>{esc(u['created_at'])}</td></tr>" for u in users)
-            return self.send_html(200, page("Admin — users", f"<table><tr><th>ID</th><th>Email</th><th>Plan</th><th>Connections</th><th>Admin</th><th>Created</th></tr>{rows}</table><p class='muted'>MVP admin is read-only. Change a plan in the database or extend this page with a plan-change form.</p>", user))
+            crows = "".join(
+                f"<tr><td>{c['id']}</td><td>{esc(c['email'])}</td><td>{esc(c['name'])}</td><td>max {c['max_volume']}</td>"
+                f"<td>{'Paused' if c['is_paused'] else 'Active'}</td>"
+                f"<td><form method='post' action='/connections/{c['id']}/pause'><input type='hidden' name='action' value='{'resume' if c['is_paused'] else 'pause'}'><button>{'Resume' if c['is_paused'] else 'Pause'}</button></form></td></tr>"
+                for c in all_conns)
+            return self.send_html(200, page("Admin — users", f"<table><tr><th>ID</th><th>Email</th><th>Plan</th><th>Connections</th><th>Admin</th><th>Created</th></tr>{rows}</table><h2>All connections — kill switch</h2><table><tr><th>ID</th><th>User</th><th>Name</th><th>Max volume</th><th>Status</th><th>Action</th></tr>{crows or '<tr><td colspan=6>No connections yet.</td></tr>'}</table><p class='muted'>Pausing a connection blocks its webhooks, stops its EA poll, and skips its pending signals. Plans are still changed in the database in this MVP.</p>", user))
 
         if path == "/download/ea":
             ea_path = os.path.join(BASE_DIR, "TradingViewBridge.mq5")
@@ -385,6 +420,11 @@ class Handler(BaseHTTPRequestHandler):
             if not c:
                 conn.close()
                 return self.send_json(401, {"error": "bad license key"})
+            if c["is_paused"]:
+                conn.close()
+                if query.get("format") == "text":
+                    return self.send_text(200, "")
+                return self.send_json(200, {"signals": [], "paused": True})
             sigs = conn.execute("SELECT * FROM signals WHERE connection_id=? AND status='pending' ORDER BY id LIMIT 20", (c["id"],)).fetchall()
             conn.close()
             if query.get("format") == "text":
@@ -478,6 +518,12 @@ class Handler(BaseHTTPRequestHandler):
                 volume = float(f.get("default_volume", "0.01") or 0.01)
             except ValueError:
                 volume = 0.01
+            try:
+                max_volume = float(f.get("max_volume", "0.10") or 0.10)
+            except ValueError:
+                max_volume = 0.10
+            if max_volume <= 0:
+                max_volume = 0.10
             conn = db()
             count = conn.execute("SELECT COUNT(*) n FROM connections WHERE user_id=?", (user["id"],)).fetchone()["n"]
             limit = PLANS.get(user["plan"], PLANS["starter"])["connections"]
@@ -485,13 +531,44 @@ class Handler(BaseHTTPRequestHandler):
                 conn.close()
                 return self.send_html(403, page("Plan limit", f"<p class='bad'>Your plan allows {limit} connection(s). Upgrade to add more.</p>", user))
             cur = conn.execute(
-                "INSERT INTO connections(user_id, name, license_key, webhook_token, symbol_map, default_volume) VALUES(?,?,?,?,?,?)",
+                "INSERT INTO connections(user_id, name, license_key, webhook_token, symbol_map, default_volume, max_volume) VALUES(?,?,?,?,?,?,?)",
                 (user["id"], f.get("name", "Connection")[:100], secrets.token_hex(16), secrets.token_hex(16),
-                 json.dumps(symbol_map), volume))
+                 json.dumps(symbol_map), volume, max_volume))
             conn.commit()
             conn_id = cur.lastrowid
             conn.close()
             return self.redirect(f"/connections/{conn_id}")
+
+        m = re.match(r"^/connections/(\d+)/(safety|pause)$", path)
+        if m:
+            user = self.require_user()
+            if not user:
+                return
+            conn_id, action_name = m.group(1), m.group(2)
+            f = self.form()
+            conn = db()
+            c = conn.execute("SELECT * FROM connections WHERE id=?", (conn_id,)).fetchone()
+            if not c or (c["user_id"] != user["id"] and not user["is_admin"]):
+                conn.close()
+                return self.send_html(403, page("Not allowed", "<p>You cannot change this connection.</p>", user))
+            if action_name == "safety":
+                try:
+                    max_volume = float(f.get("max_volume", "") or 0)
+                except ValueError:
+                    max_volume = 0
+                if max_volume <= 0:
+                    conn.close()
+                    return self.send_html(400, page("Max volume", "<p class='bad'>Max volume must be greater than 0.</p>", user))
+                conn.execute("UPDATE connections SET max_volume=? WHERE id=?", (max_volume, conn_id))
+            else:
+                if f.get("action") == "pause":
+                    conn.execute("UPDATE connections SET is_paused=1 WHERE id=?", (conn_id,))
+                    conn.execute("UPDATE signals SET status='skipped', note='connection paused (kill switch)', updated_at=datetime('now') WHERE connection_id=? AND status='pending'", (conn_id,))
+                elif f.get("action") == "resume":
+                    conn.execute("UPDATE connections SET is_paused=0 WHERE id=?", (conn_id,))
+            conn.commit()
+            conn.close()
+            return self.redirect(f"/connections/{conn_id}" if c["user_id"] == user["id"] else "/admin")
 
         m = re.match(r"^/webhook/([A-Za-z0-9]+)$", path)
         if m:
@@ -501,12 +578,21 @@ class Handler(BaseHTTPRequestHandler):
             if not c:
                 conn.close()
                 return self.send_json(404, {"error": "unknown webhook"})
+            if c["is_paused"]:
+                conn.close()
+                return self.send_json(403, {"error": "connection paused"})
             signal, err = parse_signal_body(raw)
             if err:
                 conn.close()
                 return self.send_json(400, {"error": err})
+            if signal["volume"] < 0:
+                conn.close()
+                return self.send_json(400, {"error": "volume must not be negative"})
             if not signal["volume"]:
                 signal["volume"] = c["default_volume"]
+            if signal["action"] in ("buy", "sell") and signal["volume"] > c["max_volume"]:
+                conn.close()
+                return self.send_json(400, {"error": f"volume {signal['volume']} exceeds max volume {c['max_volume']}"})
             cur = conn.execute(
                 "INSERT INTO signals(connection_id, raw, action, symbol, volume, sl, tp) VALUES(?,?,?,?,?,?,?)",
                 (c["id"], raw[:2000], signal["action"], signal["symbol"], signal["volume"], signal["sl"], signal["tp"]))
